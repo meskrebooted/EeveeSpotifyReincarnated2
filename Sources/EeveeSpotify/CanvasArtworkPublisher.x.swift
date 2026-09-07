@@ -175,7 +175,7 @@ private var canvasResolvedSources: [String: URL] {
     set { canvasPublishQueue.sync { _canvasResolvedSources = newValue } }
 }
 
-private func findCanvasVideoFile(modifiedSince cutoff: Date) -> URL? {
+private func findCanvasVideoFile(modifiedSince cutoff: Date, excluding pinnedPaths: Set<String>) -> URL? {
     let fm = FileManager.default
     var roots: [URL] = []
     roots.append(URL(fileURLWithPath: NSTemporaryDirectory()))
@@ -204,9 +204,17 @@ private func findCanvasVideoFile(modifiedSince cutoff: Date) -> URL? {
                 continue
             }
             guard canvasVideoExtensions.contains(url.pathExtension.lowercased()) else { continue }
+            // Skip files that were already pinned to a different (still-tracked) track.
+            // Without this, a fast skip / gapless prefetch can make the adjacent track's
+            // cache file look like "the newest one" for the track we're currently resolving.
+            if pinnedPaths.contains(url.path) { continue }
             guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
                   values.isRegularFile == true,
                   let mod = values.contentModificationDate else { continue }
+            // Skip files still being written by Spotify's own downloader: if the size
+            // changes within a short window, it's not a finished download yet, and
+            // publishing it now is how we end up with the wrong or a stuck artwork.
+            guard isCanvasFileStable(url) else { continue }
             let name = url.lastPathComponent
             let isCanvasCache = name.contains("upload-artist-") || name.contains(".cnvs")
             let matchesArtist = artistID.map { name.contains("artist-\($0)") } ?? false
@@ -233,6 +241,19 @@ private func findCanvasVideoFile(modifiedSince cutoff: Date) -> URL? {
         }
     }
     return fileIDMatch?.url ?? artistMatch?.url ?? newestRecent?.url
+}
+
+// Fix for "wrong/adjacent track" and "sometimes never loads": a candidate file whose
+// size is still changing is either an in-progress download (grabbing it now can yield
+// a partial/corrupt video, which silently fails to crop) or a file being overwritten
+// for the next track (grabbing it now can attach the wrong track's canvas). A 150ms
+// double-read is enough to distinguish "still writing" from "already on disk".
+private func isCanvasFileStable(_ url: URL) -> Bool {
+    let fm = FileManager.default
+    guard let size1 = try? fm.attributesOfItem(atPath: url.path)[.size] as? UInt64 else { return false }
+    Thread.sleep(forTimeInterval: 0.15)
+    guard let size2 = try? fm.attributesOfItem(atPath: url.path)[.size] as? UInt64 else { return false }
+    return size1 == size2 && size1 > 0
 }
 
 private func canvasCleanupOldCrops() {
@@ -369,6 +390,11 @@ private func ensureCanvasArtwork(for uri: String) {
         canvasPreviewImage = nil
         canvasScanStart = Date()
         canvasResolving = false
+        // Fix for slow lock screen artwork: previously a track change inherited the
+        // previous track's throttle timer, so the first scan for the *new* track could
+        // be delayed up to canvasScanThrottle seconds for no reason. A track change is
+        // always worth scanning for immediately.
+        lastScanAttempt = .distantPast
         canvasCleanupOldCrops()
         writeDebugLog("[CANVAS][PUB] new track uri=\(uri)")
     }
@@ -389,8 +415,9 @@ private func ensureCanvasArtwork(for uri: String) {
     guard !canvasResolving else { return }
     lastScanAttempt = now
     canvasResolving = true
+    let pinnedPaths = Set(canvasResolvedSources.values.map { $0.path })
     DispatchQueue.global(qos: .utility).async {
-        let found = findCanvasVideoFile(modifiedSince: scanStart)
+        let found = findCanvasVideoFile(modifiedSince: scanStart, excluding: pinnedPaths)
         var cropped: URL?
         var preview: UIImage?
         if let found = found {
