@@ -69,46 +69,10 @@ class CanvasDownloadTaskProbeHook: ClassHook<NSObject> {
     }
 }
 
-private let canvasProbeSweepQueue = DispatchQueue(label: "com.eeveespotify.canvas.probe-sweep")
-private var canvasProbeSeen: Set<String> = []
-
-private func canvasProbeSweepOnce() {
-    let fm = FileManager.default
-    var roots: [URL] = []
-    roots.append(URL(fileURLWithPath: NSTemporaryDirectory()))
-    roots.append(contentsOf: fm.urls(for: .cachesDirectory, in: .userDomainMask))
-    roots.append(contentsOf: fm.urls(for: .applicationSupportDirectory, in: .userDomainMask))
-    for root in roots {
-        guard let enumerator = fm.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles],
-            errorHandler: { _, _ in true }
-        ) else { continue }
-        while let item = enumerator.nextObject() {
-            guard let url = item as? URL else { continue }
-            if url.lastPathComponent.hasPrefix("canvas_") { continue }
-            if enumerator.level > 6 {
-                enumerator.skipDescendants()
-                continue
-            }
-            guard canvasVideoExtensions.contains(url.pathExtension.lowercased()) else { continue }
-            if canvasProbeSeen.insert(url.path).inserted {
-                writeDebugLog("[CANVAS][PROBE] sweep found \(url.path)")
-            }
-        }
-    }
-}
-
-private func canvasStartProbeSweeper() {
-    let deadline = Date(timeIntervalSinceNow: 3600)
-    canvasProbeSweepQueue.async {
-        while Date() < deadline {
-            autoreleasepool { canvasProbeSweepOnce() }
-            Thread.sleep(forTimeInterval: 4)
-        }
-    }
-}
+// NOTE: the old debug-only probe sweeper (a full recursive scan of tmp/caches/
+// application-support every 4s for an hour, purely for logging) has been removed.
+// It never contributed to resolving the canvas video and was competing for disk
+// I/O with the real resolver below, which is the actual bottleneck path.
 
 private let canvasKey3x4 = "MPNowPlayingInfoProperty3x4AnimatedArtwork"
 private let canvasKey1x1 = "MPNowPlayingInfoProperty1x1AnimatedArtwork"
@@ -128,51 +92,73 @@ private var canvasAnimatedAspect: CGFloat {
     canvasAnimatedKey == canvasKey1x1 ? 1.0 : 0.75
 }
 
-private let canvasPublishQueue = DispatchQueue(label: "com.eeveespotify.canvas.publish")
-private var _canvasURI: String?
-private var _canvasVideoURL: URL?
-private var _canvasArtworkBox: AnyObject?
-private var _canvasPreviewImage: UIImage?
-private var _canvasScanStart: Date?
-private var _canvasResolving = false
-private var _lastScanAttempt: Date = .distantPast
-private var _canvasResolvedSources: [String: URL] = [:]
+// All mutable canvas state lives in one struct behind one NSLock. This replaces
+// the previous design of one DispatchQueue.sync round-trip per property per
+// access (a thread hop + scheduling overhead for every single read/write,
+// happening dozens of times per resolve cycle and on every heartbeat tick).
+// A plain lock over a struct is materially cheaper for this access pattern
+// and behaviorally identical (still fully serialized/thread-safe).
+private struct CanvasState {
+    var uri: String?
+    var videoURL: URL?
+    var artworkBox: AnyObject?
+    var previewImage: UIImage?
+    var scanStart: Date?
+    var resolving = false
+    var lastScanAttempt: Date = .distantPast
+    var resolvedSources: [String: URL] = [:]
+}
+
+private let canvasStateLock = NSLock()
+private var canvasState = CanvasState()
+
+@discardableResult
+private func withCanvasState<T>(_ body: (inout CanvasState) -> T) -> T {
+    canvasStateLock.lock()
+    defer { canvasStateLock.unlock() }
+    return body(&canvasState)
+}
 
 private let canvasScanWindow: TimeInterval = 600
-private let canvasScanThrottle: TimeInterval = 5
+// Fix for slow first paint: previously the resolver could only attempt a scan
+// once every 5s, so if the video wasn't ready on the first try you could wait
+// up to ~5 extra seconds doing nothing. 0.4s keeps CPU/disk load negligible
+// (a scan is only a few ms once probe-sweeping is gone) while making the
+// artwork appear almost as soon as the file is actually stable on disk.
+private let canvasScanThrottle: TimeInterval = 0.4
 
 private var canvasURI: String? {
-    get { canvasPublishQueue.sync { _canvasURI } }
-    set { canvasPublishQueue.sync { _canvasURI = newValue } }
+    get { withCanvasState { $0.uri } }
+    set { withCanvasState { $0.uri = newValue } }
 }
 private var canvasVideoURL: URL? {
-    get { canvasPublishQueue.sync { _canvasVideoURL } }
-    set { canvasPublishQueue.sync { _canvasVideoURL = newValue } }
+    get { withCanvasState { $0.videoURL } }
+    set { withCanvasState { $0.videoURL = newValue } }
 }
 private var canvasArtworkBox: AnyObject? {
-    get { canvasPublishQueue.sync { _canvasArtworkBox } }
-    set { canvasPublishQueue.sync { _canvasArtworkBox = newValue } }
+    get { withCanvasState { $0.artworkBox } }
+    set { withCanvasState { $0.artworkBox = newValue } }
 }
 private var canvasPreviewImage: UIImage? {
-    get { canvasPublishQueue.sync { _canvasPreviewImage } }
-    set { canvasPublishQueue.sync { _canvasPreviewImage = newValue } }
+    get { withCanvasState { $0.previewImage } }
+    set { withCanvasState { $0.previewImage = newValue } }
 }
 private var canvasScanStart: Date? {
-    get { canvasPublishQueue.sync { _canvasScanStart } }
-    set { canvasPublishQueue.sync { _canvasScanStart = newValue } }
+    get { withCanvasState { $0.scanStart } }
+    set { withCanvasState { $0.scanStart = newValue } }
 }
 private var canvasRepushing = false
 private var canvasResolving: Bool {
-    get { canvasPublishQueue.sync { _canvasResolving } }
-    set { canvasPublishQueue.sync { _canvasResolving = newValue } }
+    get { withCanvasState { $0.resolving } }
+    set { withCanvasState { $0.resolving = newValue } }
 }
 private var lastScanAttempt: Date {
-    get { canvasPublishQueue.sync { _lastScanAttempt } }
-    set { canvasPublishQueue.sync { _lastScanAttempt = newValue } }
+    get { withCanvasState { $0.lastScanAttempt } }
+    set { withCanvasState { $0.lastScanAttempt = newValue } }
 }
 private var canvasResolvedSources: [String: URL] {
-    get { canvasPublishQueue.sync { _canvasResolvedSources } }
-    set { canvasPublishQueue.sync { _canvasResolvedSources = newValue } }
+    get { withCanvasState { $0.resolvedSources } }
+    set { withCanvasState { $0.resolvedSources = newValue } }
 }
 
 private func findCanvasVideoFile(modifiedSince cutoff: Date, excluding pinnedPaths: Set<String>) -> URL? {
@@ -208,13 +194,14 @@ private func findCanvasVideoFile(modifiedSince cutoff: Date, excluding pinnedPat
             // Without this, a fast skip / gapless prefetch can make the adjacent track's
             // cache file look like "the newest one" for the track we're currently resolving.
             if pinnedPaths.contains(url.path) { continue }
-            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]),
                   values.isRegularFile == true,
                   let mod = values.contentModificationDate else { continue }
-            // Skip files still being written by Spotify's own downloader: if the size
-            // changes within a short window, it's not a finished download yet, and
-            // publishing it now is how we end up with the wrong or a stuck artwork.
-            guard isCanvasFileStable(url) else { continue }
+            // Skip files still being written by Spotify's own downloader. A file
+            // that's mid-download keeps getting its mtime bumped, so "not modified
+            // in the last ~120ms" is a reliable, single-stat, non-blocking way to
+            // tell "finished" from "still writing" — no sleep required.
+            guard isCanvasFileStable(mod: mod, size: values.fileSize ?? 0) else { continue }
             let name = url.lastPathComponent
             let isCanvasCache = name.contains("upload-artist-") || name.contains(".cnvs")
             let matchesArtist = artistID.map { name.contains("artist-\($0)") } ?? false
@@ -246,14 +233,22 @@ private func findCanvasVideoFile(modifiedSince cutoff: Date, excluding pinnedPat
 // Fix for "wrong/adjacent track" and "sometimes never loads": a candidate file whose
 // size is still changing is either an in-progress download (grabbing it now can yield
 // a partial/corrupt video, which silently fails to crop) or a file being overwritten
-// for the next track (grabbing it now can attach the wrong track's canvas). A 150ms
-// double-read is enough to distinguish "still writing" from "already on disk".
-private func isCanvasFileStable(_ url: URL) -> Bool {
-    let fm = FileManager.default
-    guard let size1 = try? fm.attributesOfItem(atPath: url.path)[.size] as? UInt64 else { return false }
-    Thread.sleep(forTimeInterval: 0.15)
-    guard let size2 = try? fm.attributesOfItem(atPath: url.path)[.size] as? UInt64 else { return false }
-    return size1 == size2 && size1 > 0
+// for the next track (grabbing it now can attach the wrong track's canvas).
+//
+// The original check did a 150ms Thread.sleep + a second attributesOfItem read,
+// *synchronously, per candidate file, inside the scan loop*. With several cached
+// video files that alone added well over a second of blocking wait to every scan.
+//
+// A file that's still being written keeps its modification date moving forward,
+// so "mtime is more than canvasStabilityAge old" — using data already fetched in
+// the same directory-enumeration pass — gives the same guarantee with one stat
+// call total and zero sleeping. A file that's still mid-write is simply skipped
+// this round; the next scan (canvasScanThrottle later, now 0.4s) picks it up
+// once it settles.
+private let canvasStabilityAge: TimeInterval = 0.12
+
+private func isCanvasFileStable(mod: Date, size: Int) -> Bool {
+    size > 0 && Date().timeIntervalSince(mod) > canvasStabilityAge
 }
 
 private func canvasCleanupOldCrops() {
@@ -265,15 +260,28 @@ private func canvasCleanupOldCrops() {
     }
 }
 
-private func canvasCropVideo(_ source: URL, aspect: CGFloat) -> URL? {
+// Was synchronous: blocked its background thread on a DispatchSemaphore with a
+// 30s timeout while AVAssetExportSession worked. That's dead thread time doing
+// nothing useful — the export is already asynchronous internally, so we now just
+// forward its own completion instead of manufacturing a blocking wait around it.
+private func canvasCropVideoAsync(_ source: URL, aspect: CGFloat, completion: @escaping (URL?) -> Void) {
     let asset = AVURLAsset(url: source)
-    guard let track = asset.tracks(withMediaType: .video).first else { return nil }
+    guard let track = asset.tracks(withMediaType: .video).first else {
+        completion(nil)
+        return
+    }
     let size = track.naturalSize.applying(track.preferredTransform)
     let w = abs(size.width)
     let h = abs(size.height)
-    guard w > 0, h > 0 else { return nil }
+    guard w > 0, h > 0 else {
+        completion(nil)
+        return
+    }
     let ratio = w / h
-    if abs(ratio - aspect) < 0.05 { return source }
+    if abs(ratio - aspect) < 0.05 {
+        completion(source)
+        return
+    }
 
     let cropRect: CGRect
     if ratio > aspect {
@@ -300,20 +308,16 @@ private func canvasCropVideo(_ source: URL, aspect: CGFloat) -> URL? {
     let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("canvas_\(UUID().uuidString).mp4")
     guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
-        return nil
+        completion(nil)
+        return
     }
     session.outputURL = outputURL
     session.outputFileType = .mp4
     session.videoComposition = composition
     session.shouldOptimizeForNetworkUse = false
-    let sema = DispatchSemaphore(value: 0)
-    var ok = false
     session.exportAsynchronously {
-        ok = session.status == .completed
-        sema.signal()
+        completion(session.status == .completed ? outputURL : nil)
     }
-    _ = sema.wait(timeout: .now() + 30)
-    return ok ? outputURL : nil
 }
 
 private func canvasPreviewFrame(_ url: URL, aspect: CGFloat) -> UIImage? {
@@ -418,25 +422,32 @@ private func ensureCanvasArtwork(for uri: String) {
     let pinnedPaths = Set(canvasResolvedSources.values.map { $0.path })
     DispatchQueue.global(qos: .utility).async {
         let found = findCanvasVideoFile(modifiedSince: scanStart, excluding: pinnedPaths)
-        var cropped: URL?
-        var preview: UIImage?
-        if let found = found {
-            cropped = canvasCropVideo(found, aspect: canvasAnimatedAspect)
-            preview = cropped.flatMap { canvasPreviewFrame($0, aspect: canvasAnimatedAspect) }
-        }
-        DispatchQueue.main.async {
-            canvasResolving = false
-            guard uri == canvasURI else { return }
-            if let found = found, let cropped = cropped {
-                canvasVideoURL = cropped
-                canvasPreviewImage = preview
-                canvasResolvedSources[uri] = found
-                writeDebugLog("[CANVAS][PUB] resolved video \(found.path) cropped=\(cropped.path) pinned=\(found.lastPathComponent)")
-            } else if let found = found {
-                writeDebugLog("[CANVAS][PUB] crop failed for \(found.path), skipping")
+        guard let found = found else {
+            DispatchQueue.main.async {
+                canvasResolving = false
+                guard uri == canvasURI else { return }
+                if canvasArtworkBox == nil {
+                    rebuildCanvasArtwork(for: uri)
+                }
             }
-            if canvasArtworkBox == nil {
-                rebuildCanvasArtwork(for: uri)
+            return
+        }
+        canvasCropVideoAsync(found, aspect: canvasAnimatedAspect) { cropped in
+            let preview = cropped.flatMap { canvasPreviewFrame($0, aspect: canvasAnimatedAspect) }
+            DispatchQueue.main.async {
+                canvasResolving = false
+                guard uri == canvasURI else { return }
+                if let cropped = cropped {
+                    canvasVideoURL = cropped
+                    canvasPreviewImage = preview
+                    canvasResolvedSources[uri] = found
+                    writeDebugLog("[CANVAS][PUB] resolved video \(found.path) cropped=\(cropped.path) pinned=\(found.lastPathComponent)")
+                } else {
+                    writeDebugLog("[CANVAS][PUB] crop failed for \(found.path), skipping")
+                }
+                if canvasArtworkBox == nil {
+                    rebuildCanvasArtwork(for: uri)
+                }
             }
         }
     }
@@ -513,7 +524,6 @@ func activateCanvasArtworkPublisher() {
         writeDebugLog("[CANVAS][PUB] disabled: supportedAnimatedArtworkKeys unavailable (iOS < 26)")
         return
     }
-    canvasStartProbeSweeper()
     canvasStartHeartbeat()
     CanvasPublisherGroup().activate()
     writeDebugLog("[CANVAS][PUB] activated (iOS 26 animated artwork publisher) key=\(canvasAnimatedKey ?? "nil")")
