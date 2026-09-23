@@ -601,6 +601,7 @@ struct EeveeSpotify: Tweak {
             activateEeveeProbes()
             // ── START OF AI GENERATED CODE ──
             activateCanvasArtworkPublisher()
+            activateCanvasClassScanner() // DIAGNOSTICO — togli una volta confermati i nomi reali
             // ── END OF AI GENERATED CODE ──
             activateSponsorBlock()
             return
