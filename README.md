@@ -1,4 +1,4 @@
-https://filebin.net/eevee-35712715375-1/EeveeSpotify-7.0.0-9.1.78.ipa
+[https://filebin.net/eevee-35712715375-1/EeveeSpotify-7.0.0-9.1.78.ipa](https://filebin.net/eevee-35826449722-1/EeveeSpotify-7.0.0-9.1.78-20260923-062242.ipa)
 ![Banner](Images/banner.png?)
 
 # EeveeSpotifyReincarnated
