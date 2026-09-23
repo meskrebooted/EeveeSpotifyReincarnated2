@@ -466,20 +466,32 @@ class CanvasNowPlayingInfoCenterHook: ClassHook<NSObject> {
             if canvasVideoSupported {
                 let dictURI = (info?["MPNowPlayingInfoPropertyExternalContentIdentifier"] as? String)
                     .flatMap { $0.hasPrefix("spotify:") ? $0 : nil }
-                let uri = dictURI ?? capturedTrackURI
-                if let uri = uri {
+                let resolvedURI = dictURI ?? capturedTrackURI
+                if let resolvedURI = resolvedURI {
                     if dictURI != nil {
                         writeDebugLog("[CANVAS][NPIC] dictURI=\(dictURI!) captured=\(capturedTrackURI ?? "nil")")
                     }
-                    ensureCanvasArtwork(for: uri)
-                    if canvasURI == uri,
-                       let artwork = canvasArtworkBox as? MPMediaItemAnimatedArtwork,
-                       let key = canvasAnimatedKey {
-                        var merged = info ?? [:]
-                        merged[key] = artwork
-                        orig.setNowPlayingInfo(merged)
-                        return
-                    }
+                    ensureCanvasArtwork(for: resolvedURI)
+                }
+                // Fix for "loads once then disappears": MPNowPlayingInfoCenter fully
+                // replaces its dictionary on every set, it never merges. Spotify calls
+                // setNowPlayingInfo constantly for things like elapsed-time updates, and
+                // many of those calls don't include the external content identifier, so
+                // `resolvedURI` comes back nil. The old code required a freshly resolved
+                // uri to attach the animated key, so it silently forwarded those calls
+                // bare — each one wiped out the canvas that had just been shown.
+                //
+                // A nil resolvedURI here isn't evidence the track changed, so as long as
+                // we still have a tracked canvasURI with a ready artwork, and this call
+                // isn't clearly about a *different* track, keep attaching it.
+                if let uri = canvasURI,
+                   resolvedURI == nil || resolvedURI == uri,
+                   let artwork = canvasArtworkBox as? MPMediaItemAnimatedArtwork,
+                   let key = canvasAnimatedKey {
+                    var merged = info ?? [:]
+                    merged[key] = artwork
+                    orig.setNowPlayingInfo(merged)
+                    return
                 }
             }
         }
